@@ -17,6 +17,10 @@ def worker_main(gpu_index, name: str, task_q, result_q):
     import torch  # noqa: E402  (must come after env var)
 
     torch.backends.cuda.matmul.allow_tf32 = True
+    if not torch.cuda.is_available():
+        result_q.put(("fatal", name, f"PyTorch {torch.__version__} has no CUDA support. Reinstall with: "
+                      "pip uninstall -y torch torchvision && pip install torch torchvision "
+                      "--index-url https://download.pytorch.org/whl/cu128"))
     cache = {}
     result_q.put(("ready", name, {
         "name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu",

@@ -56,6 +56,12 @@ class GPUPool:
     def _pump(self):
         while True:
             kind, key, payload = self.result_q.get()
+            if kind == "fatal":
+                if not getattr(self, "_warned", False):
+                    print("\n" + "!" * 70 + f"\nERROR: {payload}\n" + "!" * 70 + "\n", flush=True)
+                    self.on_progress(key, {"text": "NO CUDA - see console"})
+                    self._warned = True
+                continue
             if kind == "ready":
                 self.info[key] = payload
                 continue
