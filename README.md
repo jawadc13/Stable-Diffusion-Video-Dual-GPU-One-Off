@@ -37,6 +37,16 @@ Each expert gets its own card, and only a small latent tensor crosses PCIe per s
 - Connect an image to `WanVideo` to get image-to-video.
 - Expect several minutes per 5 s clip at 480p for A14B. TI2V-5B is much faster.
 
+### Speed
+- `speed: lightning-4step` (default for A14B) loads the **Wan2.2-Lightning** distilled LoRAs
+  (`lightx2v/Wan2.2-Lightning`, one per expert). It runs 4 steps at CFG 1 instead of 30 steps
+  with CFG, so about 15x fewer transformer passes. Download them once with `run.bat --online`.
+  Set `speed: off` for the full 30-step quality.
+- `attention: auto` uses **SageAttention** if installed, which makes attention about 2x faster on RTX 40 cards:
+  `pip install triton-windows sageattention==1.0.6`
+- `quant_high: Q3_K_M` keeps the high-noise expert resident on the 4070 Super, so it doesn't
+  stream over PCIe every step.
+
 The per-card workers and the dual worker never hold models at the same time.
 Switching between Wan and the per-card nodes (SVD, upscale, interpolate) unloads the other group automatically.
 

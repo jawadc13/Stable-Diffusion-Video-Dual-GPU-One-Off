@@ -111,13 +111,71 @@ def _on_device_cls(torch):
     return OnDevice
 
 
+LIGHTNING_REPO = "lightx2v/Wan2.2-Lightning"
+
+
+def _find_lightning(variant, which):
+    """Locate the 4-step Lightning LoRA (high_noise / low_noise) locally, else download if --online."""
+    kind = "i2v" if variant == "A14B-I2V" else "t2v"
+    def ok(path):
+        l = path.lower().replace("\\", "/")
+        return (l.endswith(".safetensors") and f"{kind}-a14b-4steps" in l and f"{which}_model" in l)
+    hits = []
+    for d in _model_dirs():
+        for dp, _, files in os.walk(d):
+            hits += [os.path.join(dp, f) for f in files if ok(os.path.join(dp, f))]
+    if hits:
+        return sorted(hits)[-1]  # latest version (V1.1 > V1)
+    if os.environ.get("HF_HUB_OFFLINE") == "1":
+        raise FileNotFoundError(
+            "Lightning LoRA not found locally. Start the app once with --online to download it "
+            f"from {LIGHTNING_REPO} (~1.2 GB), or put the high_noise_model/low_noise_model "
+            "safetensors in ./models/Wan2.2-" + kind.upper() + "-A14B-4steps-lora/")
+    from huggingface_hub import hf_hub_download, list_repo_files
+    files = sorted(f for f in list_repo_files(LIGHTNING_REPO) if ok(f))
+    if not files:
+        raise FileNotFoundError(f"No {kind} 4-step {which} LoRA in {LIGHTNING_REPO}")
+    return hf_hub_download(LIGHTNING_REPO, files[-1])
+
+
+def _load_lightning(pipe, variant):
+    """Wan2.2-Lightning: distilled 4-step LoRAs (one per expert). Runs at CFG 1, so each
+    step is a single forward pass instead of two -> ~15x fewer passes than 30 steps + CFG."""
+    hi, lo = _find_lightning(variant, "high_noise"), _find_lightning(variant, "low_noise")
+    print(f"[wan] Lightning LoRAs:\n  {hi}\n  {lo}", flush=True)
+    pipe.load_lora_weights(hi, adapter_name="lightning")
+    pipe.load_lora_weights(lo, adapter_name="lightning_2", load_into_transformer_2=True)
+
+
+def _set_attention(pipe, mode):
+    """SageAttention (8-bit attention kernels) is ~2x faster than PyTorch SDPA on RTX 40.
+    'auto' uses it when the sageattention package is installed, else PyTorch default."""
+    if mode == "native":
+        return
+    backend = {"auto": "sage", "sage": "sage", "flash": "flash"}[mode]
+    for t in (pipe.transformer, getattr(pipe, "transformer_2", None)):
+        if t is None:
+            continue
+        try:
+            t.set_attention_backend(backend)
+        except Exception as e:
+            if mode != "auto":
+                raise RuntimeError(f"attention backend '{backend}' unavailable: {e}")
+            print(f"[wan] SageAttention not available ({type(e).__name__}); using PyTorch SDPA. "
+                  "pip install triton-windows sageattention to enable.", flush=True)
+            return
+    print(f"[wan] attention backend: {backend}", flush=True)
+
+
 def _build(torch, cache, p):
     from diffusers import WanImageToVideoPipeline, WanPipeline
     from transformers import UMT5EncoderModel
 
     variant = p["variant"]
     repo, gguf = REPOS[variant], GGUF_REPOS[variant]
-    key = ("wan", variant, p["quant_high"], p["quant_low"], bool(p.get("image")))
+    speed = p.get("speed", "off")
+    key = ("wan", variant, p["quant_high"], p["quant_low"], bool(p.get("image")), speed,
+           p.get("attention", "auto"))
     if cache.get("key") == key:
         return cache["pipe"], cache["te"]
     cache.clear()
@@ -141,6 +199,10 @@ def _build(torch, cache, p):
     # text encoder sits on the CPU.
     pipe.__class__ = type(cls.__name__ + "Dual", (cls,),
                           {"_execution_device": property(lambda s: torch.device(d0))})
+
+    if speed == "lightning-4step" and variant != "5B":
+        _load_lightning(pipe, variant)
+    _set_attention(pipe, p.get("attention", "auto"))
 
     _place(torch, cache, pipe.transformer, d0, p.get("offload_high", "auto"), "high")
     if getattr(pipe, "transformer_2", None) is not None:
@@ -222,6 +284,8 @@ def task_wan(torch, cache, p, progress):
         cache["embeds"] = {ek: (pe.to(torch.bfloat16), ne.to(torch.bfloat16))}
     pe, ne = cache["embeds"][ek]
 
+    if p.get("speed") == "lightning-4step" and p["variant"] != "5B":
+        p = dict(p, steps=4, guidance=1.0, guidance_2=1.0)
     steps = p["steps"]
 
     def cb(_pipe, i, t, kw):
