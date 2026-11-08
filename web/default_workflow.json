@@ -1,0 +1,20 @@
+{
+  "nodes": [
+    {"id": "1", "cls": "TextPrompt", "x": 0, "y": 0, "widgets": {}},
+    {"id": "2", "cls": "MiniMaxVideo", "x": 300, "y": 0, "widgets": {}},
+    {"id": "3", "cls": "LastFrame", "x": 660, "y": 0, "widgets": {}},
+    {"id": "4", "cls": "SVDDualGPU", "x": 660, "y": 120, "widgets": {"batch": 1, "mode": "pipeline"}},
+    {"id": "5", "cls": "ConcatFrames", "x": 1000, "y": 0, "widgets": {}},
+    {"id": "6", "cls": "InterpolateDualGPU", "x": 1000, "y": 140, "widgets": {}},
+    {"id": "7", "cls": "SaveVideo", "x": 1320, "y": 0, "widgets": {"fps": 24}}
+  ],
+  "links": [
+    {"from": ["1", 0], "to": ["2", "prompt"]},
+    {"from": ["2", 1], "to": ["3", "frames"]},
+    {"from": ["3", 0], "to": ["4", "image"]},
+    {"from": ["2", 1], "to": ["5", "a"]},
+    {"from": ["4", 0], "to": ["5", "b"]},
+    {"from": ["5", 0], "to": ["6", "frames"]},
+    {"from": ["6", 0], "to": ["7", "frames"]}
+  ]
+}
