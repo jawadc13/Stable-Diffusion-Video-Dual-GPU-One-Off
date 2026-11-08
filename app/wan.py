@@ -254,15 +254,8 @@ def _stream(torch, cache, model, dev, tag):
     cache[f"{tag}_streamed"] = True
 
 
-def task_wan(torch, cache, p, progress):
-    from PIL import Image
-
-    from .worker import _save_frames
-
-    pipe, te = _build(torch, cache, p)
-    vae, d1 = cache["vae"], cache["d1"]
-
-    # ---- prompt embeddings on CPU (cached) ----
+def _embeds(torch, cache, pipe, p, progress):
+    """Prompt embeddings on CPU (cached). The text encoder is loaded, used and freed."""
     ek = (p["prompt"], p["negative_prompt"])
     if ek not in cache["embeds"]:
         import gc
@@ -282,7 +275,18 @@ def task_wan(torch, cache, p, progress):
             del te
             gc.collect()
         cache["embeds"] = {ek: (pe.to(torch.bfloat16), ne.to(torch.bfloat16))}
-    pe, ne = cache["embeds"][ek]
+    return cache["embeds"][ek]
+
+
+def task_wan(torch, cache, p, progress):
+    from PIL import Image
+
+    from .worker import _save_frames
+
+    pipe, te = _build(torch, cache, p)
+    vae, d1 = cache["vae"], cache["d1"]
+
+    pe, ne = _embeds(torch, cache, pipe, p, progress)
 
     if p.get("speed") == "lightning-4step" and p["variant"] != "5B":
         p = dict(p, steps=4, guidance=1.0, guidance_2=1.0)
@@ -340,3 +344,154 @@ def task_wan(torch, cache, p, progress):
         if low is not None:
             low.m.to(d1)
     return {"frames": _save_frames(frames, p["out"])}
+
+
+# --------------------------------------------------------------------------- #
+# Pipelined batch: both GPUs busy at the same time
+# --------------------------------------------------------------------------- #
+#
+#   time ->      clip0          clip1          clip2
+#   4070 S  [A: high steps][A: high steps][A: high steps]
+#   4060 Ti                [B: low+decode ][B: low+decode ][B: low+decode]
+#
+# Stage A (primary card) runs the high-noise steps of clip k+1 while stage B
+# (secondary card) runs the low-noise steps + VAE decode of clip k. Each clip owns a
+# private copy of the scheduler; the scheduler math and latents live on the CPU
+# (a few MB), so a clip can hop between cards with no device juggling.
+
+def _denoise(torch, model, dev, sched, latents, ts, pe, ne, g, cond, cancel):
+    """Run timesteps `ts` with `model` on `dev`. latents/sched stay on CPU."""
+    pe_d, ne_d = pe.to(dev), ne.to(dev)
+    for t in ts:
+        if cancel.is_set():
+            raise RuntimeError("cancelled (other stage failed)")
+        x = latents.to(dev, torch.bfloat16)
+        if cond is not None:
+            x = torch.cat([x, cond.to(dev, torch.bfloat16)], dim=1)
+        tt = t.expand(x.shape[0]).to(dev)
+        with torch.no_grad():
+            out = model(hidden_states=x, timestep=tt, encoder_hidden_states=pe_d, return_dict=False)[0]
+            if g > 1.0:
+                un = model(hidden_states=x, timestep=tt, encoder_hidden_states=ne_d, return_dict=False)[0]
+                out = un + g * (out - un)
+        latents = sched.step(out.float().cpu(), t, latents, return_dict=False)[0]
+        yield latents
+
+
+def task_wan_batch(torch, cache, p, progress):
+    """Generate len(seeds) clips with the two experts working concurrently."""
+    import copy
+    import queue
+    import threading
+
+    from PIL import Image
+
+    from .worker import _save_frames
+
+    seeds = p["seeds"]
+    if p["variant"] == "5B" or torch.cuda.device_count() < 2 or len(seeds) == 1:
+        # nothing to overlap -> plain sequential runs
+        out = []
+        for i, s in enumerate(seeds):
+            progress({"text": f"clip {i + 1}/{len(seeds)}"})
+            out.append(task_wan(torch, cache, dict(p, seed=s, out=f"{p['out']}_{i}"), progress)["frames"])
+        return {"clips": out}
+
+    pipe, _ = _build(torch, cache, p)
+    pe, ne = _embeds(torch, cache, pipe, p, progress)
+    if p.get("speed") == "lightning-4step":
+        p = dict(p, steps=4, guidance=1.0, guidance_2=1.0)
+    steps, d0, d1 = p["steps"], "cuda:0", cache["d1"]
+    high, low = pipe.transformer, pipe.transformer_2.m
+    vae = cache["vae"]
+    vae_lock = threading.Lock()  # Wan VAE keeps internal caches -> one user at a time
+
+    base = copy.deepcopy(pipe.scheduler)
+    base.set_timesteps(steps, device="cpu")
+    boundary = pipe.config.boundary_ratio * base.config.num_train_timesteps
+    ts_high = [t for t in base.timesteps if t >= boundary]
+    ts_low = [t for t in base.timesteps if t < boundary]
+    i2v = p["variant"] == "A14B-I2V"
+    image = None
+    if i2v:
+        image = Image.open(p["image"]).convert("RGB").resize((p["width"], p["height"]))
+
+    handoff = queue.Queue(maxsize=1)   # A waits if B is still busy (bounded RAM use)
+    cancel = threading.Event()
+    errors, results = [], [None] * len(seeds)
+    done_steps = {"a": 0, "b": 0}
+    total = len(seeds) * steps
+
+    def report():
+        progress({"step": done_steps["a"] + done_steps["b"], "steps": total,
+                  "text": f"4070S(high) {done_steps['a']}/{len(seeds) * len(ts_high)} | "
+                          f"4060Ti(low) {done_steps['b']}/{len(seeds) * len(ts_low)}"})
+
+    def stage_a():
+        torch.cuda.set_device(torch.device(d0))  # streams/offload hooks use the thread's device
+        try:
+            for i, seed in enumerate(seeds):
+                sched = copy.deepcopy(base)
+                gen = torch.Generator("cpu").manual_seed(seed)
+                cond = None
+                if i2v:
+                    img = pipe.video_processor.preprocess(image, height=p["height"], width=p["width"]) \
+                        .to(d0, torch.float32)
+                    with vae_lock, torch.no_grad():
+                        lat, cond = pipe.prepare_latents(
+                            img, 1, vae.config.z_dim, p["height"], p["width"], p["frames"],
+                            torch.float32, torch.device(d0), gen, None)
+                    lat, cond = lat.cpu(), cond.cpu()
+                else:
+                    lat = pipe.prepare_latents(1, high.config.in_channels, p["height"], p["width"],
+                                               p["frames"], torch.float32, torch.device("cpu"), gen, None)
+                for lat in _denoise(torch, high, d0, sched, lat, ts_high, pe, ne,
+                                    p["guidance"], cond, cancel):
+                    done_steps["a"] += 1
+                    report()
+                handoff.put((i, sched, lat, cond))
+        except Exception as e:  # noqa: BLE001
+            errors.append(e)
+            cancel.set()
+        finally:
+            handoff.put(None)
+
+    def stage_b():
+        torch.cuda.set_device(torch.device(d1))
+        resident = not cache.get("low_streamed")
+        try:
+            while True:
+                item = handoff.get()
+                if item is None or cancel.is_set():
+                    return
+                i, sched, lat, cond = item
+                for lat in _denoise(torch, low, d1, sched, lat, ts_low, pe, ne,
+                                    p["guidance_2"], cond, cancel):
+                    done_steps["b"] += 1
+                    report()
+                if resident:  # make room for the VAE on the 8 GB card
+                    low.to("cpu")
+                    torch.cuda.empty_cache()
+                with vae_lock, torch.no_grad():
+                    x = lat.to(d1, vae.dtype)
+                    z = vae.config.z_dim
+                    mean = torch.tensor(vae.config.latents_mean).view(1, z, 1, 1, 1).to(x)
+                    std = 1.0 / torch.tensor(vae.config.latents_std).view(1, z, 1, 1, 1).to(x)
+                    video = vae.decode(x / std + mean, return_dict=False)[0]
+                    frames = pipe.video_processor.postprocess_video(video, output_type="pil")[0]
+                    del video, x
+                if resident:
+                    low.to(d1)
+                results[i] = _save_frames(frames, f"{p['out']}_{i}")
+                progress({"text": f"clip {i + 1}/{len(seeds)} finished"})
+        except Exception as e:  # noqa: BLE001
+            errors.append(e)
+            cancel.set()
+            while handoff.get() is not None:  # unblock stage A
+                pass
+
+    ta, tb = threading.Thread(target=stage_a), threading.Thread(target=stage_b)
+    ta.start(); tb.start(); ta.join(); tb.join()
+    if errors:
+        raise errors[0]
+    return {"clips": results}

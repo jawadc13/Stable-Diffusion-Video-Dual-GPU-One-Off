@@ -47,6 +47,19 @@ Each expert gets its own card, and only a small latent tensor crosses PCIe per s
 - `quant_high: Q3_K_M` keeps the high-noise expert resident on the 4070 Super, so it doesn't
   stream over PCIe every step.
 
+### Batches: both GPUs busy at once
+Set `batch` on `WanVideo` above 1 (seeds `seed`, `seed+1`, ...). The clips are pipelined:
+
+```
+time ->   clip0          clip1          clip2
+4070 S   [high steps]   [high steps]   [high steps]
+4060 Ti                 [low + decode] [low + decode] [low + decode]
+```
+The 4070 Super starts the next clip's high-noise steps while the 4060 Ti finishes the previous
+clip. Throughput approaches 2x for long batches. Each clip is saved as `output/wan_seed<N>_*.mp4`,
+and the node outputs all clips back to back. Works with A14B text-to-video and image-to-video,
+plus Lightning. TI2V-5B batches run sequentially, because it has only one expert.
+
 The per-card workers and the dual worker never hold models at the same time.
 Switching between Wan and the per-card nodes (SVD, upscale, interpolate) unloads the other group automatically.
 

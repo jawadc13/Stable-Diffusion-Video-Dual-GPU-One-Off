@@ -164,6 +164,7 @@ class WanVideo(Node):
         "guidance": {"type": "float", "default": 4.0, "min": 1, "max": 10, "step": 0.5},
         "guidance_2": {"type": "float", "default": 3.0, "min": 1, "max": 10, "step": 0.5},
         "seed": {"type": "int", "default": 42, "min": 0, "max": 2**31 - 1},
+        "batch": {"type": "int", "default": 1, "min": 1, "max": 64},
         "quant_high": {"type": "combo", "default": "Q4_K_M", "options": QUANTS},
         "quant_low": {"type": "combo", "default": "Q3_K_M", "options": QUANTS},
         "speed": {"type": "combo", "default": "lightning-4step", "options": ["lightning-4step", "off"]},
@@ -176,7 +177,7 @@ class WanVideo(Node):
     }
     OUTPUTS = [("FRAMES", "FRAMES")]
 
-    def run(self, ctx, prompt, model, resolution, frames, steps, guidance, guidance_2, seed,
+    def run(self, ctx, prompt, model, resolution, frames, steps, guidance, guidance_2, seed, batch,
             quant_high, quant_low, speed, attention, offload_high, offload_low, negative_prompt, image=None):
         w, h = map(int, resolution.split("x"))
         frames = (frames - 1) // 4 * 4 + 1
@@ -185,13 +186,25 @@ class WanVideo(Node):
             ctx.log("TI2V-5B: tip -- Q8_0 fits the 4070 Super comfortably and keeps full quality")
         ctx.log(f"Wan 2.2 {variant} {w}x{h} {frames}f on {ctx.pool.dual} "
                 "(first run downloads the model)")
-        fut = ctx.pool.submit("wan", dict(
+        params = dict(
             variant=variant, prompt=prompt, negative_prompt=negative_prompt, image=image,
             width=w, height=h, frames=frames, steps=steps, guidance=guidance,
             guidance_2=guidance_2, seed=seed, quant_high=quant_high, quant_low=quant_low,
             offload_high=offload_high, offload_low=offload_low, speed=speed, attention=attention,
-            out=_tmp("wan")), ctx.pool.dual)
-        return (fut.result()["frames"],)
+            out=_tmp("wan"))
+        if batch == 1:
+            return (ctx.pool.submit("wan", params, ctx.pool.dual).result()["frames"],)
+        # Batch: seeds seed..seed+batch-1, pipelined so both GPUs work at once.
+        # Each clip is also saved as its own MP4; the output is all clips back to back.
+        ctx.log(f"batch of {batch}: 4070S runs high-noise steps of the next clip while "
+                "4060Ti finishes the previous one")
+        clips = ctx.pool.submit("wan_batch", dict(params, seeds=[seed + k for k in range(batch)]),
+                                ctx.pool.dual).result()["clips"]
+        for k, c in enumerate(clips):
+            name = _write_mp4(c, f"wan_seed{seed + k}", 16)
+            ctx.log(f"saved output/{name}")
+        return ([f for c in clips for f in c],)
+
 
 
 # ------------------------------------------------------ Local SVD dual GPU --
@@ -337,6 +350,20 @@ class InterpolateDualGPU(Node):
 
 
 # ---------------------------------------------------------------- outputs --
+def _write_mp4(frames, prefix, fps, quality=8):
+    import imageio
+    import numpy as np
+    from PIL import Image
+    name = f"{prefix}_{time.strftime('%Y%m%d_%H%M%S')}.mp4"
+    size = Image.open(frames[0]).size
+    with imageio.get_writer(os.path.join(OUTPUT_DIR, name), fps=fps, quality=quality,
+                            macro_block_size=8) as w:
+        for f in frames:
+            im = Image.open(f).convert("RGB")
+            w.append_data(np.array(im if im.size == size else im.resize(size)))
+    return name
+
+
 @node
 class SaveVideo(Node):
     CATEGORY = "output"

@@ -217,5 +217,6 @@ TASKS = {
 }
 
 
-from .wan import task_wan  # noqa: E402
+from .wan import task_wan, task_wan_batch  # noqa: E402
 TASKS["wan"] = task_wan
+TASKS["wan_batch"] = task_wan_batch
