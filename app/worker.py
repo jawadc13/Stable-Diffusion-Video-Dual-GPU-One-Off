@@ -9,7 +9,10 @@ import os
 import traceback
 
 
-def worker_main(gpu_index: int, name: str, task_q, result_q):
+def worker_main(gpu_index, name: str, task_q, result_q):
+    # gpu_index is an int (one card) or "0,1" (the dual worker sees both cards:
+    # cuda:0 = primary/4070 Super, cuda:1 = secondary/4060 Ti)
+    os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"  # match nvidia-smi numbering
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_index)
     import torch  # noqa: E402  (must come after env var)
 
@@ -20,6 +23,12 @@ def worker_main(gpu_index: int, name: str, task_q, result_q):
         "vram_gb": round(torch.cuda.get_device_properties(0).total_memory / 2**30, 1)
         if torch.cuda.is_available() else 0,
     }))
+
+    if torch.cuda.device_count() > 1:
+        result_q.put(("ready", name, {
+            "name": " + ".join(torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())),
+            "vram_gb": round(sum(torch.cuda.get_device_properties(i).total_memory
+                                 for i in range(torch.cuda.device_count())) / 2**30, 1)}))
 
     while True:
         job = task_q.get()
@@ -33,6 +42,8 @@ def worker_main(gpu_index: int, name: str, task_q, result_q):
         except Exception as e:  # report to the scheduler, keep worker alive
             result_q.put(("error", job_id, f"{e}\n{traceback.format_exc()}"))
         finally:
+            import gc
+            gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
@@ -178,9 +189,19 @@ def _save_frames(frames, out_dir):
     return paths
 
 
+def task_unload(torch, cache, p, progress):
+    cache.clear()
+    return {}
+
+
 TASKS = {
+    "unload": task_unload,
     "svd": task_svd,
     "vae_decode": task_vae_decode,
     "upscale": task_upscale,
     "interpolate": task_interpolate,
 }
+
+
+from .wan import task_wan  # noqa: E402
+TASKS["wan"] = task_wan

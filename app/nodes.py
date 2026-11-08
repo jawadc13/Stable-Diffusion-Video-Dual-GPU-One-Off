@@ -74,7 +74,7 @@ class TextPrompt(Node):
 # ------------------------------------------------------------- MiniMax API --
 @node
 class MiniMaxVideo(Node):
-    """Text/Image -> video via MiniMax Hailuo cloud API. Runs on MiniMax's servers;
+    """(Optional, needs a paid API key) Text/Image -> video via MiniMax Hailuo cloud API. Runs on MiniMax's servers;
     the result is pulled back as frames so your local GPUs can post-process it."""
     CATEGORY = "generate"
     INPUTS = {"prompt": ("STRING", False), "first_frame": ("IMAGE", True)}
@@ -139,6 +139,54 @@ def _video_to_frames(path):
         Image.fromarray(fr).save(p)
         paths.append(p)
     return paths
+
+
+# ------------------------------------------------ Wan 2.2 (open, no key) --
+QUANTS = ["Q8_0", "Q6_K", "Q5_K_M", "Q4_K_M", "Q3_K_M", "bf16"]
+
+
+@node
+class WanVideo(Node):
+    """Wan 2.2 text/image -> video. Open weights (Apache-2.0), runs 100% locally, no API key.
+
+    A14B (best quality): high-noise expert on the primary GPU, low-noise expert on the
+    secondary GPU, VAE decode on the secondary. TI2V-5B (faster): transformer on primary,
+    VAE on secondary. Text encoder runs on CPU / system RAM. Connect an image for
+    image-to-video. Frames are rounded to 4n+1."""
+    CATEGORY = "generate"
+    INPUTS = {"prompt": ("STRING", False), "image": ("IMAGE", True)}
+    WIDGETS = {
+        "model": {"type": "combo", "default": "A14B", "options": ["A14B", "TI2V-5B"]},
+        "resolution": {"type": "combo", "default": "832x480",
+                       "options": ["832x480", "480x832", "1280x720", "720x1280", "1280x704", "704x1280", "640x640"]},
+        "frames": {"type": "int", "default": 81, "min": 5, "max": 161, "step": 4},
+        "steps": {"type": "int", "default": 30, "min": 4, "max": 80},
+        "guidance": {"type": "float", "default": 4.0, "min": 1, "max": 10, "step": 0.5},
+        "guidance_2": {"type": "float", "default": 3.0, "min": 1, "max": 10, "step": 0.5},
+        "seed": {"type": "int", "default": 42, "min": 0, "max": 2**31 - 1},
+        "quant_high": {"type": "combo", "default": "Q4_K_M", "options": QUANTS},
+        "quant_low": {"type": "combo", "default": "Q3_K_M", "options": QUANTS},
+        "negative_prompt": {"type": "text", "default":
+                            "blurry, low quality, worst quality, distorted, deformed, static, "
+                            "watermark, text, subtitles, jpeg artifacts, extra fingers, bad anatomy"},
+    }
+    OUTPUTS = [("FRAMES", "FRAMES")]
+
+    def run(self, ctx, prompt, model, resolution, frames, steps, guidance, guidance_2, seed,
+            quant_high, quant_low, negative_prompt, image=None):
+        w, h = map(int, resolution.split("x"))
+        frames = (frames - 1) // 4 * 4 + 1
+        variant = "5B" if model == "TI2V-5B" else ("A14B-I2V" if image else "A14B-T2V")
+        if variant == "5B" and quant_high not in ("Q8_0", "bf16"):
+            ctx.log("TI2V-5B: tip -- Q8_0 fits the 4070 Super comfortably and keeps full quality")
+        ctx.log(f"Wan 2.2 {variant} {w}x{h} {frames}f on {ctx.pool.dual} "
+                "(first run downloads the model)")
+        fut = ctx.pool.submit("wan", dict(
+            variant=variant, prompt=prompt, negative_prompt=negative_prompt, image=image,
+            width=w, height=h, frames=frames, steps=steps, guidance=guidance,
+            guidance_2=guidance_2, seed=seed, quant_high=quant_high, quant_low=quant_low,
+            out=_tmp("wan")), ctx.pool.dual)
+        return (fut.result()["frames"],)
 
 
 # ------------------------------------------------------ Local SVD dual GPU --
