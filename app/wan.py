@@ -115,11 +115,11 @@ def _build(torch, cache, p):
     pipe.__class__ = type(cls.__name__ + "Dual", (cls,),
                           {"_execution_device": property(lambda s: torch.device(d0))})
 
-    pipe.transformer.to(d0)
+    _place(torch, cache, pipe.transformer, d0, p.get("offload_high", "auto"), "high")
     if getattr(pipe, "transformer_2", None) is not None:
         low = OnDevice(pipe.transformer_2, d1, d0)
         object.__setattr__(pipe, "transformer_2", low)
-        _place_low(torch, cache, low, d1, p.get("offload_low", "auto"))
+        _place(torch, cache, low.m, d1, p.get("offload_low", "auto"), "low")
     pipe.vae.to(d1)
     if hasattr(pipe.vae, "enable_tiling"):
         pipe.vae.enable_tiling()
@@ -131,37 +131,38 @@ def _build(torch, cache, p):
     return pipe, te
 
 
-def _place_low(torch, cache, low, d1, mode):
-    """Put the low-noise expert on the secondary card if it *really* fits (weights +
-    VAE + ~2.5 GB of activations), otherwise stream it from RAM. An 8 GB card usually
-    has ~7 GB free (Windows/desktop takes the rest), so a 7 GB Q3 expert can't be resident."""
-    weights = sum(t.numel() * t.element_size() for t in low.m.parameters())
-    weights += sum(t.numel() * t.element_size() for t in low.m.buffers())
-    free = torch.cuda.mem_get_info(torch.device(d1))[0]
+def _place(torch, cache, model, dev, mode, tag):
+    """Keep `model` resident on `dev` only if weights + ~3 GB of activations fit in the
+    card's *currently free* VRAM (the desktop/DWM eats some); otherwise stream it from RAM."""
+    weights = sum(t.numel() * t.element_size() for t in model.parameters())
+    weights += sum(t.numel() * t.element_size() for t in model.buffers())
+    free = torch.cuda.mem_get_info(torch.device(dev))[0]
     need = weights + int(3.0 * 2**30)
-    print(f"[wan] low-noise expert {weights / 2**30:.1f} GB, {d1} free {free / 2**30:.1f} GB "
+    print(f"[wan] {tag}-noise expert {weights / 2**30:.1f} GB, {dev} free {free / 2**30:.1f} GB "
           f"(need ~{need / 2**30:.1f} GB to keep it resident)", flush=True)
     if mode == "always" or (mode == "auto" and need > free):
-        _stream_low(torch, cache, low, d1)
+        _stream(torch, cache, model, dev, tag)
         return
     try:
-        low.m.to(d1)
+        model.to(dev)
     except torch.cuda.OutOfMemoryError:
         if mode == "never":
             raise
-        _stream_low(torch, cache, low, d1)
+        _stream(torch, cache, model, dev, tag)
 
 
-def _stream_low(torch, cache, low, d1):
-    """Group offload: weights stay in (pinned) RAM, blocks are copied to the card just in
+def _stream(torch, cache, model, dev, tag):
+    """Group offload: weights stay in system RAM, blocks are copied to the card just in
     time on a side CUDA stream so the copy overlaps compute. Costs a few seconds per
     step over PCIe 3.0 x8, but needs only ~1-2 GB of VRAM for weights."""
-    print(f"[wan] streaming low-noise expert from system RAM onto {d1}", flush=True)
-    low.m.to("cpu")
+    if cache.get(f"{tag}_streamed"):
+        return
+    print(f"[wan] streaming {tag}-noise expert from system RAM onto {dev}", flush=True)
+    model.to("cpu")
     torch.cuda.empty_cache()
-    low.m.enable_group_offload(onload_device=torch.device(d1), offload_device=torch.device("cpu"),
+    model.enable_group_offload(onload_device=torch.device(dev), offload_device=torch.device("cpu"),
                                offload_type="block_level", num_blocks_per_group=4, use_stream=True)
-    cache["low_streamed"] = True
+    cache[f"{tag}_streamed"] = True
 
 
 def task_wan(torch, cache, p, progress):
@@ -200,21 +201,23 @@ def task_wan(torch, cache, p, progress):
         args["image"] = Image.open(p["image"]).convert("RGB").resize((p["width"], p["height"]))
 
     low = getattr(pipe, "transformer_2", None)
-    mode = p.get("offload_low", "auto")
-    try:
-        with torch.no_grad():
-            latents = pipe(**args).frames
-    except torch.cuda.OutOfMemoryError:
-        # Typical on an 8 GB secondary card: keep the low-noise expert's weights in
-        # system RAM and stream them block-by-block over PCIe, then retry once.
-        if low is None or mode == "never" or cache.get("low_streamed"):
-            raise
-        progress({"text": "secondary GPU out of memory -> streaming low-noise expert from RAM, retrying"})
-        torch.cuda.empty_cache()
-        _stream_low(torch, cache, low, d1)
-        args["generator"] = torch.Generator("cpu").manual_seed(p["seed"])
-        with torch.no_grad():
-            latents = pipe(**args).frames
+    d0 = "cuda:0"
+    for attempt in range(3):
+        try:
+            args["generator"] = torch.Generator("cpu").manual_seed(p["seed"])
+            with torch.no_grad():
+                latents = pipe(**args).frames
+            break
+        except torch.cuda.OutOfMemoryError as e:
+            # The message names the card ("GPU 0" / "GPU 1"). Stream that card's expert
+            # from RAM and retry, unless it's already streaming or the user said never.
+            gpu1 = "GPU 1" in str(e) and low is not None
+            tag, model, dev = ("low", low.m, d1) if gpu1 else ("high", pipe.transformer, d0)
+            if cache.get(f"{tag}_streamed") or p.get(f"offload_{tag}", "auto") == "never":
+                raise
+            progress({"text": f"{dev} out of memory -> streaming {tag}-noise expert from RAM, retrying"})
+            torch.cuda.empty_cache()
+            _stream(torch, cache, model, dev, tag)
 
     # ---- decode on the secondary card; free room there first in A14B mode ----
     progress({"text": "decoding on secondary GPU..."})

@@ -166,6 +166,7 @@ class WanVideo(Node):
         "seed": {"type": "int", "default": 42, "min": 0, "max": 2**31 - 1},
         "quant_high": {"type": "combo", "default": "Q4_K_M", "options": QUANTS},
         "quant_low": {"type": "combo", "default": "Q3_K_M", "options": QUANTS},
+        "offload_high": {"type": "combo", "default": "auto", "options": ["auto", "always", "never"]},
         "offload_low": {"type": "combo", "default": "auto", "options": ["auto", "always", "never"]},
         "negative_prompt": {"type": "text", "default":
                             "blurry, low quality, worst quality, distorted, deformed, static, "
@@ -174,7 +175,7 @@ class WanVideo(Node):
     OUTPUTS = [("FRAMES", "FRAMES")]
 
     def run(self, ctx, prompt, model, resolution, frames, steps, guidance, guidance_2, seed,
-            quant_high, quant_low, offload_low, negative_prompt, image=None):
+            quant_high, quant_low, offload_high, offload_low, negative_prompt, image=None):
         w, h = map(int, resolution.split("x"))
         frames = (frames - 1) // 4 * 4 + 1
         variant = "5B" if model == "TI2V-5B" else ("A14B-I2V" if image else "A14B-T2V")
@@ -186,7 +187,7 @@ class WanVideo(Node):
             variant=variant, prompt=prompt, negative_prompt=negative_prompt, image=image,
             width=w, height=h, frames=frames, steps=steps, guidance=guidance,
             guidance_2=guidance_2, seed=seed, quant_high=quant_high, quant_low=quant_low,
-            offload_low=offload_low,
+            offload_high=offload_high, offload_low=offload_low,
             out=_tmp("wan")), ctx.pool.dual)
         return (fut.result()["frames"],)
 
