@@ -28,7 +28,9 @@ That matters on a 4-core i5-6600K: the Python GIL can't serialize the cards.
 Wan 2.2 A14B is a two-expert model: the high-noise expert does the early steps and the low-noise expert does the late ones.
 Each expert gets its own card, and only a small latent tensor crosses PCIe per step. The experts are GGUF-quantized
 (QuantStack repos, downloaded automatically on first run):
-- 4060 Ti **8 GB**: keep `quant_low` at `Q3_K_M`.
+- 4060 Ti **8 GB**: keep `quant_low` at `Q3_K_M`. With `offload_low: auto`, an out-of-memory error on the
+  4060 Ti makes the low-noise expert stream from system RAM block by block, and the run retries
+  automatically (slower, but it fits). Set it to `always` to skip the failed first attempt.
 - 4060 Ti **16 GB**: raise `quant_low` to `Q5_K_M` or `Q8_0` for better quality.
 - `quant_high` `Q4_K_M` fits the 12 GB 4070 Super at 832x480. Use 720p with `Q3_K_M`, or fewer frames.
 - Prompt embeddings are cached, so re-running with a new seed skips the text encoder.

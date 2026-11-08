@@ -130,6 +130,17 @@ def _build(torch, cache, p):
     return pipe, te
 
 
+def _stream_low(torch, cache, low, d1):
+    """Group offload: weights stay in (pinned) RAM, blocks are copied to the card just in
+    time on a side CUDA stream so the copy overlaps compute. Costs a few seconds per
+    step over PCIe 3.0 x8, but needs only ~1-2 GB of VRAM for weights."""
+    low.m.to("cpu")
+    torch.cuda.empty_cache()
+    low.m.enable_group_offload(onload_device=torch.device(d1), offload_device=torch.device("cpu"),
+                               offload_type="block_level", num_blocks_per_group=4, use_stream=True)
+    cache["low_streamed"] = True
+
+
 def task_wan(torch, cache, p, progress):
     from PIL import Image
 
@@ -165,12 +176,29 @@ def task_wan(torch, cache, p, progress):
     if p.get("image"):
         args["image"] = Image.open(p["image"]).convert("RGB").resize((p["width"], p["height"]))
 
-    with torch.no_grad():
-        latents = pipe(**args).frames
+    low = getattr(pipe, "transformer_2", None)
+    mode = p.get("offload_low", "auto")
+    if low is not None and mode == "always" and not cache.get("low_streamed"):
+        _stream_low(torch, cache, low, d1)
+    try:
+        with torch.no_grad():
+            latents = pipe(**args).frames
+    except torch.cuda.OutOfMemoryError:
+        # Typical on an 8 GB secondary card: keep the low-noise expert's weights in
+        # system RAM and stream them block-by-block over PCIe, then retry once.
+        if low is None or mode == "never" or cache.get("low_streamed"):
+            raise
+        progress({"text": "secondary GPU out of memory -> streaming low-noise expert from RAM, retrying"})
+        torch.cuda.empty_cache()
+        _stream_low(torch, cache, low, d1)
+        args["generator"] = torch.Generator("cpu").manual_seed(p["seed"])
+        with torch.no_grad():
+            latents = pipe(**args).frames
 
     # ---- decode on the secondary card; free room there first in A14B mode ----
     progress({"text": "decoding on secondary GPU..."})
-    low = getattr(pipe, "transformer_2", None)
+    if cache.get("low_streamed"):
+        low = None  # weights already live in RAM; only one block is ever on the card
     if low is not None:
         low.m.to("cpu")
         torch.cuda.empty_cache()
