@@ -117,8 +117,9 @@ def _build(torch, cache, p):
 
     pipe.transformer.to(d0)
     if getattr(pipe, "transformer_2", None) is not None:
-        pipe.transformer_2.to(d1)
-        object.__setattr__(pipe, "transformer_2", OnDevice(pipe.transformer_2, d1, d0))
+        low = OnDevice(pipe.transformer_2, d1, d0)
+        object.__setattr__(pipe, "transformer_2", low)
+        _place_low(torch, cache, low, d1, p.get("offload_low", "auto"))
     pipe.vae.to(d1)
     if hasattr(pipe.vae, "enable_tiling"):
         pipe.vae.enable_tiling()
@@ -130,10 +131,32 @@ def _build(torch, cache, p):
     return pipe, te
 
 
+def _place_low(torch, cache, low, d1, mode):
+    """Put the low-noise expert on the secondary card if it *really* fits (weights +
+    VAE + ~2.5 GB of activations), otherwise stream it from RAM. An 8 GB card usually
+    has ~7 GB free (Windows/desktop takes the rest), so a 7 GB Q3 expert can't be resident."""
+    weights = sum(t.numel() * t.element_size() for t in low.m.parameters())
+    weights += sum(t.numel() * t.element_size() for t in low.m.buffers())
+    free = torch.cuda.mem_get_info(torch.device(d1))[0]
+    need = weights + int(3.0 * 2**30)
+    print(f"[wan] low-noise expert {weights / 2**30:.1f} GB, {d1} free {free / 2**30:.1f} GB "
+          f"(need ~{need / 2**30:.1f} GB to keep it resident)", flush=True)
+    if mode == "always" or (mode == "auto" and need > free):
+        _stream_low(torch, cache, low, d1)
+        return
+    try:
+        low.m.to(d1)
+    except torch.cuda.OutOfMemoryError:
+        if mode == "never":
+            raise
+        _stream_low(torch, cache, low, d1)
+
+
 def _stream_low(torch, cache, low, d1):
     """Group offload: weights stay in (pinned) RAM, blocks are copied to the card just in
     time on a side CUDA stream so the copy overlaps compute. Costs a few seconds per
     step over PCIe 3.0 x8, but needs only ~1-2 GB of VRAM for weights."""
+    print(f"[wan] streaming low-noise expert from system RAM onto {d1}", flush=True)
     low.m.to("cpu")
     torch.cuda.empty_cache()
     low.m.enable_group_offload(onload_device=torch.device(d1), offload_device=torch.device("cpu"),
@@ -178,8 +201,6 @@ def task_wan(torch, cache, p, progress):
 
     low = getattr(pipe, "transformer_2", None)
     mode = p.get("offload_low", "auto")
-    if low is not None and mode == "always" and not cache.get("low_streamed"):
-        _stream_low(torch, cache, low, d1)
     try:
         with torch.no_grad():
             latents = pipe(**args).frames
