@@ -69,6 +69,14 @@ run.bat          # or ./run.sh
 ```
 Open http://127.0.0.1:8188. Use `--gpus 0,1` to choose cards.
 
+Models load **offline** (local files only, no Hugging Face contact). On a fresh PC, or to try a quant you
+haven't downloaded, start once with `run.bat --online`. You can also drop `.gguf` files into `./models`.
+
+**Windows tip:** In NVIDIA Control Panel, go to Manage 3D settings → Program Settings → `python.exe`, and set
+**CUDA - Sysmem Fallback Policy = Prefer No Sysmem Fallback**. Without it, a full card silently spills
+into "shared GPU memory" (system RAM and the pagefile), which is very slow. With it, the app gets a real
+out-of-memory error and switches to its own (much faster) RAM streaming instead.
+
 ## Using the editor
 - Double-click or right-click the canvas to add a node. Drag from an output dot to an input dot to connect them (types must match by color).
 - Click an input dot to disconnect it. Press Del to delete the selected node. Press Ctrl+Enter to queue.

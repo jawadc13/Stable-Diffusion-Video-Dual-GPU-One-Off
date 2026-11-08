@@ -8,8 +8,8 @@ A14B  : Mixture-of-Experts. The high-noise expert (early steps, layout/motion) l
         cuda:0, the low-noise expert (late steps, detail) lives on cuda:1. Latents hop
         across PCIe once per step (a few MB -- negligible). VAE decode also on cuda:1.
 TI2V-5B: transformer on cuda:0, VAE (encode + decode) on cuda:1.
-Both  : UMT5-XXL text encoder runs on the CPU in fp32 (~22 GB system RAM), and prompt
-        embeddings are cached so changing only the seed doesn't re-encode.
+Both  : UMT5-XXL text encoder runs on the CPU in fp32 only while a new prompt is encoded,
+        then is freed (keeps RAM for the streamed experts); embeddings are cached so changing only the seed doesn't re-encode.
 """
 import os
 
@@ -25,8 +25,33 @@ GGUF_REPOS = {
 }
 
 
+def _model_dirs():
+    """Where to look for local .gguf files: ./models first, then the existing HF cache."""
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    hf = os.environ.get("HF_HUB_CACHE") or os.path.join(
+        os.environ.get("HF_HOME", os.path.join(os.path.expanduser("~"), ".cache", "huggingface")), "hub")
+    return [os.path.join(root, "models"), hf]
+
+
 def _find_gguf(repo, hint, quant):
-    """Pick the .gguf in `repo` whose path contains `hint` (HighNoise/LowNoise) and `quant`."""
+    """Pick a local .gguf whose path contains `hint` (HighNoise/LowNoise) and `quant`.
+    Offline by default -- only downloads when the server was started with --online."""
+    want = repo.split("/")[-1].lower().replace("-gguf", "")
+    hits = []
+    for d in _model_dirs():
+        for dp, _, files in os.walk(d):
+            for f in files:
+                full = os.path.join(dp, f)
+                low = full.lower()
+                if f.endswith(".gguf") and quant.lower() in f.lower() and hint.lower() in low \
+                        and (want in low or want.replace("-", "_") in low or want in f.lower()):
+                    hits.append(full)
+    if hits:
+        return sorted(hits, key=len)[0]
+    if os.environ.get("HF_HUB_OFFLINE") == "1":
+        raise FileNotFoundError(
+            f"No local {quant} {hint or ''} .gguf for {repo}. Put it in ./models, or start the app "
+            f"once with --online to download it.")
     from huggingface_hub import hf_hub_download, list_repo_files
     files = [f for f in list_repo_files(repo)
              if f.endswith(".gguf") and quant.lower() in f.lower() and hint.lower() in f.lower()]
@@ -100,8 +125,10 @@ def _build(torch, cache, p):
     d0, d1 = "cuda:0", ("cuda:1" if dual else "cuda:0")
     OnDevice = _on_device_cls(torch)
 
-    te = UMT5EncoderModel.from_pretrained(repo, subfolder="text_encoder", torch_dtype=torch.float32)
-    kw = {"text_encoder": te}
+    # Text encoder is NOT kept loaded: it's ~22 GB in fp32 and would push the streamed
+    # experts into the pagefile. It's loaded only when the prompt changes (see task_wan).
+    te = None
+    kw = {"text_encoder": None}
     if variant == "5B":
         kw["transformer"] = _load_transformer(torch, repo, "transformer", p["quant_high"], gguf, "")
     else:
@@ -127,7 +154,7 @@ def _build(torch, cache, p):
     object.__setattr__(pipe, "vae", OnDevice(vae_raw, d1, d0))
     if getattr(pipe, "image_encoder", None) is not None:
         pipe.image_encoder.to(d0)
-    cache.update(key=key, pipe=pipe, te=te, vae=vae_raw, d1=d1, embeds={})
+    cache.update(key=key, pipe=pipe, te=te, vae=vae_raw, d1=d1, embeds={}, repo=repo)
     return pipe, te
 
 
@@ -176,11 +203,22 @@ def task_wan(torch, cache, p, progress):
     # ---- prompt embeddings on CPU (cached) ----
     ek = (p["prompt"], p["negative_prompt"])
     if ek not in cache["embeds"]:
-        progress({"text": "encoding prompt on CPU..."})
-        with torch.no_grad():
-            pe, ne = pipe.encode_prompt(prompt=p["prompt"], negative_prompt=p["negative_prompt"],
-                                        do_classifier_free_guidance=True, max_sequence_length=512,
-                                        device=torch.device("cpu"), dtype=torch.float32)
+        import gc
+
+        from transformers import UMT5EncoderModel
+        progress({"text": "encoding prompt on CPU (loads text encoder, then frees it)..."})
+        te = UMT5EncoderModel.from_pretrained(cache["repo"], subfolder="text_encoder",
+                                              torch_dtype=torch.float32, low_cpu_mem_usage=True)
+        object.__setattr__(pipe, "text_encoder", te)
+        try:
+            with torch.no_grad():
+                pe, ne = pipe.encode_prompt(prompt=p["prompt"], negative_prompt=p["negative_prompt"],
+                                            do_classifier_free_guidance=True, max_sequence_length=512,
+                                            device=torch.device("cpu"), dtype=torch.float32)
+        finally:
+            object.__setattr__(pipe, "text_encoder", None)
+            del te
+            gc.collect()
         cache["embeds"] = {ek: (pe.to(torch.bfloat16), ne.to(torch.bfloat16))}
     pe, ne = cache["embeds"][ek]
 

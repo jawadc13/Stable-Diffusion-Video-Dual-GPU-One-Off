@@ -13,6 +13,16 @@ def worker_main(gpu_index, name: str, task_q, result_q):
     # gpu_index is an int (one card) or "0,1" (the dual worker sees both cards:
     # cuda:0 = primary/4070 Super, cuda:1 = secondary/4060 Ti)
     os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"  # match nvidia-smi numbering
+    # Offline: load models only from disk, never contact Hugging Face (unless --online)
+    if os.environ.get("DUALGPU_ONLINE") != "1":
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        os.environ["TRANSFORMERS_OFFLINE"] = "1"
+        os.environ["DIFFUSERS_OFFLINE"] = "1"
+    os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
+    os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+    import warnings
+    warnings.filterwarnings("ignore", message=".*local_dir_use_symlinks.*")
+    warnings.filterwarnings("ignore", message=".*unauthenticated requests.*")
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_index)
     import torch  # noqa: E402  (must come after env var)
 

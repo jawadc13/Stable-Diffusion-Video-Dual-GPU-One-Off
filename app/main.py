@@ -180,7 +180,12 @@ def main():
     ap.add_argument("--port", type=int, default=8188)
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--gpus", default="", help="comma list of CUDA indices to use, e.g. 0,1")
+    ap.add_argument("--online", action="store_true",
+                    help="allow downloading missing models from Hugging Face (default: offline)")
     a = ap.parse_args()
+    if a.online:
+        os.environ["DUALGPU_ONLINE"] = "1"
+    print("Model loading:", "online (may download)" if a.online else "offline (local files only)")
 
     gpus = detect_gpus()
     if a.gpus:
